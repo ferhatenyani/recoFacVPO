@@ -7,3 +7,5 @@ venv/
 captures/*/
 !captures/.gitkeep
 dataset.csv
+reports/
+screenshots/

@@ -20,6 +20,7 @@ Architecture :
 from __future__ import annotations
 
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -42,50 +43,29 @@ from PIL import Image, ImageTk, ImageGrab
 from src import config, dataset, detection, features, identify, landmarks
 from src import snake as snk
 
-
-# ---------------------------------------------------------------------------
-# Charte graphique
-# ---------------------------------------------------------------------------
-
-class Theme:
-    BG_BASE      = "#141414"   # cadre exterieur
-    SURFACE_1    = "#1c1c1c"   # corps des panneaux (= door_sim BG)
-    SURFACE_2    = "#242424"   # panneaux interieurs / lignes alternees
-    SURFACE_3    = "#2e2e2e"   # survol / etat actif
-    BORDER_SOFT  = "#3a3a3a"
-    BORDER_HARD  = "#5a5a5a"
-
-    TEXT_HI      = "#e8e8e8"
-    TEXT_MID     = "#9a9a9a"
-    TEXT_LOW     = "#6a6a6a"
-
-    INFO         = "#5b9bd5"   # accent froid (groupe distances)
-    INFO_SOFT    = "#3a6a9a"
-    WARM         = "#c89858"   # accent chaud (groupe forme)
-    WARM_SOFT    = "#7a5a30"
-
-    SUCCESS      = "#33ff66"   # = door_sim LIGHT_GREEN
-    SUCCESS_DIM  = "#1f7a3a"
-    DANGER       = "#ff3333"   # = door_sim LIGHT_RED
-    DANGER_DIM   = "#7a1f1f"
-    NEUTRAL      = "#d0a040"   # ambre "en attente"
-
-    @staticmethod
-    def heading(size=14, weight="bold"):
-        return ("Segoe UI Semibold", size, weight) if weight == "bold" \
-               else ("Segoe UI", size)
-
-    @staticmethod
-    def body(size=10):
-        return ("Segoe UI", size)
-
-    @staticmethod
-    def label(size=9):
-        return ("Segoe UI", size)
-
-    @staticmethod
-    def mono(size=10):
-        return ("Cascadia Mono", size)
+# Theme + helpers UI partages avec les modales (wizard, gestionnaire,
+# popup d'attente). Ce sous-module est l'unique source de verite pour
+# la charte graphique, ce qui evite tout cycle a l'import quand
+# test_app est lance directement (auquel cas Python le charge en tant que
+# __main__, et un import "from test_app" depuis identity_ui echouerait).
+from identity_ui import (
+    Theme,
+    _bgr_to_imagetk,
+    EnrolWizard,
+    IdentityManager,
+    LoadingPopup,
+    install_extra_styles,
+    generate_evaluation_report,
+    CMD_ENROL_BATCH,
+    CMD_DELETE_PERSON,
+    CMD_GENERATE_REPORT,
+    EV_ENROL_BATCH_DONE,
+    EV_ENROL_BATCH_FAIL,
+    EV_DELETE_DONE,
+    EV_DELETE_FAIL,
+    EV_REPORT_DONE,
+    EV_REPORT_FAIL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +93,9 @@ class IdentifyResult:
 
 
 # Commandes UI -> worker
+# CMD_ENROL_BATCH / CMD_DELETE_PERSON / CMD_GENERATE_REPORT sont importes
+# depuis identity_ui (cf. plus bas, apres les helpers UI partages).
 CMD_IDENTIFY = "identify"
-CMD_ENROL    = "enrol"
 
 
 # ---------------------------------------------------------------------------
@@ -165,26 +146,6 @@ def _make_panel(parent, title):
     return outer, body
 
 
-def _bgr_to_imagetk(bgr, target_w, target_h, fit="contain"):
-    """Convertit une image BGR OpenCV en ImageTk redimensionnee.
-    fit='contain' garde l'aspect (lettre-boxe), fit='stretch' force la taille."""
-    if bgr is None:
-        return None, (target_w, target_h, 0, 0)
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if bgr.ndim == 3 else \
-          cv2.cvtColor(bgr, cv2.COLOR_GRAY2RGB)
-    pil = Image.fromarray(rgb)
-    if fit == "contain":
-        ratio = min(target_w / pil.width, target_h / pil.height)
-        new_w = max(1, int(pil.width * ratio))
-        new_h = max(1, int(pil.height * ratio))
-        pil = pil.resize((new_w, new_h), Image.BILINEAR)
-        ox = (target_w - new_w) // 2
-        oy = (target_h - new_h) // 2
-        return ImageTk.PhotoImage(pil), (new_w, new_h, ox, oy)
-    pil = pil.resize((target_w, target_h), Image.NEAREST)
-    return ImageTk.PhotoImage(pil), (target_w, target_h, 0, 0)
-
-
 # ---------------------------------------------------------------------------
 # Application principale
 # ---------------------------------------------------------------------------
@@ -233,6 +194,12 @@ class TestApp:
 
         # References d'images Tk (sinon GC)
         self._img_refs = {}
+
+        # Modales actives (wizard d'enregistrement, gestionnaire,
+        # popup d'export manuel du rapport)
+        self._enrol_wizard: Optional[EnrolWizard] = None
+        self._identity_manager: Optional[IdentityManager] = None
+        self._manual_report_popup: Optional[LoadingPopup] = None
 
         # Construction UI
         self._build_ui()
@@ -298,6 +265,10 @@ class TestApp:
                     lightcolor=Theme.INFO,
                     darkcolor=Theme.INFO_SOFT)
 
+        # Styles additionnels (LoadingPopup, scrollbar du gestionnaire,
+        # boutons fantomes des dialogues).
+        install_extra_styles(s)
+
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         outer = tk.Frame(self.root, bg=Theme.BG_BASE)
@@ -323,6 +294,13 @@ class TestApp:
             font=Theme.mono(10))
         self.dataset_label.pack(side="right", anchor="e")
 
+        # Barre de controles : construite AVANT la zone bento pour que
+        # son espace en bas du conteneur soit reserve par pack avant
+        # la zone bento (qui a expand=True). Sans cela, sur une fenetre
+        # maximisee le bento absorbait toute la hauteur et la barre
+        # se retrouvait en dehors de la zone visible.
+        self._build_controls(outer)
+
         # Zone bento : 3 colonnes x 2 lignes
         bento = tk.Frame(outer, bg=Theme.BG_BASE)
         bento.pack(side="top", fill="both", expand=True, pady=(14, 12))
@@ -340,9 +318,6 @@ class TestApp:
         self._build_chart_panel(bento)
         self._build_top3_panel(bento)
         self._build_decision_panel(bento)
-
-        # Barre de controles
-        self._build_controls(outer)
 
     def _dataset_text(self):
         with self.dataset_lock:
@@ -573,7 +548,11 @@ class TestApp:
         bar = tk.Frame(parent, bg=Theme.SURFACE_1,
                        highlightbackground=Theme.BORDER_SOFT,
                        highlightthickness=1)
-        bar.pack(side="top", fill="x")
+        # Ancrage en bas du conteneur exterieur : la barre conserve sa
+        # taille naturelle et n'est jamais rognee, meme quand la zone
+        # bento (expand=True) absorbe l'espace vertical d'une fenetre
+        # maximisee.
+        bar.pack(side="bottom", fill="x", pady=(8, 0))
 
         inner = tk.Frame(bar, bg=Theme.SURFACE_1)
         inner.pack(side="top", fill="x", padx=14, pady=12)
@@ -581,10 +560,19 @@ class TestApp:
         # Boutons gauche
         left = tk.Frame(inner, bg=Theme.SURFACE_1)
         left.pack(side="left")
-        ttk.Button(left, text="Identifier  (I)", style="VPOPrimary.TButton",
-                   command=self._on_identify).pack(side="left", padx=(0, 8))
+        self.identify_btn = ttk.Button(left, text="Identifier  (I)",
+                                       style="VPOPrimary.TButton",
+                                       command=self._on_identify)
+        self.identify_btn.pack(side="left", padx=(0, 8))
         ttk.Button(left, text="Capturer  (E)", style="VPO.TButton",
-                   command=self._on_enrol).pack(side="left", padx=(0, 8))
+                   command=self._on_open_enrol_wizard).pack(side="left",
+                                                            padx=(0, 8))
+        ttk.Button(left, text="Gerer les identites", style="VPO.TButton",
+                   command=self._on_open_manager).pack(side="left",
+                                                       padx=(0, 8))
+        ttk.Button(left, text="Exporter rapport", style="VPO.TButton",
+                   command=self._on_export_report).pack(side="left",
+                                                        padx=(0, 8))
         ttk.Button(left, text="Snapshot", style="VPO.TButton",
                    command=self._on_snapshot).pack(side="left")
 
@@ -628,10 +616,27 @@ class TestApp:
     def _bind_keys(self):
         self.root.bind("<KeyPress-i>", lambda e: self._on_identify())
         self.root.bind("<KeyPress-I>", lambda e: self._on_identify())
-        self.root.bind("<KeyPress-e>", lambda e: self._on_enrol())
-        self.root.bind("<KeyPress-E>", lambda e: self._on_enrol())
+        self.root.bind("<KeyPress-e>", lambda e: self._on_open_enrol_wizard())
+        self.root.bind("<KeyPress-E>", lambda e: self._on_open_enrol_wizard())
         self.root.bind("<KeyPress-q>", lambda e: self._on_quit())
         self.root.bind("<KeyPress-Q>", lambda e: self._on_quit())
+        # Entree relance l'identification quand le focus est sur la fenetre
+        # principale (utilise apres la fermeture de l'assistant pour
+        # permettre "I" ou Entree)
+        self.root.bind("<Return>", self._on_root_return)
+
+    def _on_root_return(self, event):
+        # Ne consomme la touche que si le focus n'est pas dans un Entry
+        try:
+            w = event.widget
+            if isinstance(w, tk.Entry) or isinstance(w, ttk.Entry):
+                return
+            if str(w.winfo_toplevel()) != str(self.root):
+                # Une modale a le focus -- laisser passer
+                return
+        except Exception:
+            pass
+        self._on_identify()
 
     # ---- Worker ------------------------------------------------------
     def _worker_loop(self):
@@ -677,8 +682,12 @@ class TestApp:
                         break
                     if action == CMD_IDENTIFY:
                         self._do_identify(aligned)
-                    elif action == CMD_ENROL:
-                        self._do_enrol(aligned, payload)
+                    elif action == CMD_ENROL_BATCH:
+                        self._do_enrol_batch(payload)
+                    elif action == CMD_DELETE_PERSON:
+                        self._do_delete_person(payload)
+                    elif action == CMD_GENERATE_REPORT:
+                        self._do_generate_report(payload)
         finally:
             cap.release()
 
@@ -701,23 +710,120 @@ class TestApp:
                              elapsed_ms=elapsed_ms)
         self.event_queue.put(("identify", res))
 
-    def _do_enrol(self, aligned, name):
-        if aligned is None:
-            self.event_queue.put(("toast", "Visage non detecte. Capture annulee."))
+    def _do_enrol_batch(self, payload):
+        """Encode toutes les images capturees par l'assistant pour <name>.
+
+        Lit chaque JPEG aligne 128x128, lance snake -> landmarks ->
+        features. Accumule dans une liste temporaire puis met a jour
+        dataset.csv et l'etat memoire sous un unique critical-section.
+        """
+        name = payload["name"]
+        paths = [Path(p) for p in payload["paths"]]
+        kept_vectors = []
+        rejected = 0
+        for p in paths:
+            img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.shape != (config.IMG_SIZE, config.IMG_SIZE):
+                rejected += 1
+                continue
+            try:
+                contour = snk.fit_snake(img)
+                lm = landmarks.detect_landmarks(img, snake=contour)
+                vec = features.build_feature_vector(lm, snake=contour)
+            except Exception:
+                rejected += 1
+                continue
+            kept_vectors.append(vec)
+
+        if not kept_vectors:
+            self.event_queue.put((EV_ENROL_BATCH_DONE,
+                                  {"name": name, "kept": 0,
+                                   "rejected": rejected}))
             return
-        contour = snk.fit_snake(aligned)
-        lm = landmarks.detect_landmarks(aligned, snake=contour)
-        vec = features.build_feature_vector(lm, snake=contour)
+
         try:
-            dataset.append(name, vec)
+            with self.dataset_lock:
+                for v in kept_vectors:
+                    dataset.append(name, v)
+                stack = np.asarray(kept_vectors, dtype=np.float32)
+                self.names.extend([name] * len(kept_vectors))
+                self.vectors = (np.vstack([self.vectors, stack])
+                                if len(self.vectors) else stack)
         except Exception as exc:
-            self.event_queue.put(("toast", f"Erreur ecriture dataset: {exc}"))
+            self.event_queue.put(
+                (EV_ENROL_BATCH_FAIL,
+                 {"error": f"{type(exc).__name__}: {exc}"}))
             return
-        with self.dataset_lock:
-            self.names.append(name)
-            self.vectors = (np.vstack([self.vectors, vec[None, :]])
-                            if len(self.vectors) else vec[None, :])
-        self.event_queue.put(("enrolled", name))
+
+        self.event_queue.put(
+            (EV_ENROL_BATCH_DONE,
+             {"name": name, "kept": len(kept_vectors),
+              "rejected": rejected}))
+
+    def _do_delete_person(self, payload):
+        """Supprime toutes les lignes <name> de dataset.csv et,
+        optionnellement, le dossier captures/<name>/."""
+        name = payload["name"]
+        delete_files = bool(payload.get("delete_files", True))
+        try:
+            with self.dataset_lock:
+                mask = np.array([n != name for n in self.names], dtype=bool)
+                new_names = [n for n, keep in zip(self.names, mask) if keep]
+                if len(self.vectors) > 0:
+                    new_vectors = self.vectors[mask]
+                else:
+                    new_vectors = self.vectors
+                dataset.write_all(new_names, new_vectors)
+                self.names = new_names
+                self.vectors = (new_vectors
+                                if isinstance(new_vectors, np.ndarray)
+                                else np.asarray(new_vectors,
+                                                dtype=np.float32))
+        except Exception as exc:
+            self.event_queue.put(
+                (EV_DELETE_FAIL,
+                 {"error": f"{type(exc).__name__}: {exc}"}))
+            return
+
+        if delete_files:
+            try:
+                shutil.rmtree(config.CAPTURES_DIR / name, ignore_errors=True)
+            except Exception:
+                pass
+
+        self.event_queue.put((EV_DELETE_DONE, {"name": name}))
+
+    def _do_generate_report(self, payload):
+        """Genere le rapport markdown pour l'etat courant du dataset."""
+        event = payload["event"]
+        name = payload.get("name")
+        threshold = float(payload["threshold"])
+        try:
+            with self.dataset_lock:
+                names_snapshot = list(self.names)
+                vectors_snapshot = (self.vectors.copy()
+                                    if len(self.vectors) else
+                                    self.vectors)
+            path = generate_evaluation_report(
+                names=names_snapshot,
+                vectors=vectors_snapshot,
+                threshold=threshold,
+                event=event,
+                name=name,
+                root_dir=ROOT,
+            )
+        except Exception as exc:
+            self.event_queue.put(
+                (EV_REPORT_FAIL,
+                 {"error": f"{type(exc).__name__}: {exc}"}))
+            return
+        try:
+            rel = path.relative_to(ROOT)
+        except ValueError:
+            rel = path
+        self.event_queue.put(
+            (EV_REPORT_DONE,
+             {"path": str(rel).replace("\\", "/")}))
 
     # ---- Polling Tk --------------------------------------------------
     def _poll(self):
@@ -737,12 +843,22 @@ class TestApp:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "identify":
                     self._on_identify_result(payload)
-                elif kind == "enrolled":
-                    self._on_enrolled(payload)
                 elif kind == "toast":
                     self._show_toast(payload)
                 elif kind == "error":
                     self._show_toast(payload, level="error")
+                elif kind == EV_ENROL_BATCH_DONE:
+                    self._on_enrol_batch_done(payload)
+                elif kind == EV_ENROL_BATCH_FAIL:
+                    self._on_enrol_batch_fail(payload)
+                elif kind == EV_DELETE_DONE:
+                    self._on_delete_done(payload)
+                elif kind == EV_DELETE_FAIL:
+                    self._on_delete_fail(payload)
+                elif kind == EV_REPORT_DONE:
+                    self._on_report_done(payload)
+                elif kind == EV_REPORT_FAIL:
+                    self._on_report_fail(payload)
         except queue.Empty:
             pass
 
@@ -1080,67 +1196,132 @@ class TestApp:
     def _on_identify(self):
         self.cmd_queue.put((CMD_IDENTIFY, None))
 
-    def _on_enrol(self):
-        # Modale de saisie du nom
-        win = tk.Toplevel(self.root)
-        win.title("Enregistrer une identite")
-        win.configure(bg=Theme.SURFACE_1)
-        win.transient(self.root)
-        win.grab_set()
-        win.resizable(False, False)
-        x = self.root.winfo_rootx() + self.root.winfo_width() // 2 - 200
-        y = self.root.winfo_rooty() + self.root.winfo_height() // 2 - 80
-        win.geometry(f"400x180+{max(x,0)}+{max(y,0)}")
+    def _on_open_enrol_wizard(self):
+        """Ouvre le wizard d'enregistrement multi-poses."""
+        if (self._enrol_wizard is not None
+                and self._enrol_wizard.winfo_exists()):
+            self._enrol_wizard.lift()
+            return
+        self._enrol_wizard = EnrolWizard(self)
 
-        tk.Label(win, text="Nouvelle identite",
-                 bg=Theme.SURFACE_1, fg=Theme.TEXT_HI,
-                 font=Theme.heading(13)).pack(side="top",
-                                              anchor="w",
-                                              padx=20, pady=(18, 4))
-        tk.Label(win,
-                 text="Le visage actuel sera encode et ajoute au dataset.csv.",
-                 bg=Theme.SURFACE_1, fg=Theme.TEXT_MID,
-                 font=Theme.label(9)).pack(side="top",
-                                           anchor="w",
-                                           padx=20, pady=(0, 10))
+    def _on_open_manager(self):
+        """Ouvre le gestionnaire des identites."""
+        if (self._identity_manager is not None
+                and self._identity_manager.winfo_exists()):
+            self._identity_manager.lift()
+            return
+        self._identity_manager = IdentityManager(self)
 
-        entry = tk.Entry(win, bg=Theme.SURFACE_2, fg=Theme.TEXT_HI,
-                         insertbackground=Theme.TEXT_HI,
-                         relief="flat",
-                         font=Theme.body(11))
-        entry.pack(side="top", fill="x", padx=20, ipady=6)
-        entry.focus_set()
+    def _on_export_report(self):
+        """Genere un rapport manuel sur l'etat courant du dataset."""
+        if self._manual_report_popup is not None:
+            return
+        self._manual_report_popup = LoadingPopup(
+            self.root, "Rapport",
+            "Generation du rapport d'evaluation...")
+        self.cmd_queue.put(
+            (CMD_GENERATE_REPORT,
+             {"event": "manual", "name": None,
+              "threshold": float(self.threshold_var.get())}))
 
-        msg_var = tk.StringVar(value="")
-        tk.Label(win, textvariable=msg_var,
-                 bg=Theme.SURFACE_1, fg=Theme.DANGER,
-                 font=Theme.label(9)).pack(side="top",
-                                           anchor="w", padx=20, pady=(4, 0))
-
-        btns = tk.Frame(win, bg=Theme.SURFACE_1)
-        btns.pack(side="bottom", fill="x", padx=20, pady=14)
-
-        def confirm():
-            name = entry.get().strip()
-            if not name:
-                msg_var.set("Le nom ne peut pas etre vide.")
-                return
-            if any(ch in name for ch in ";\n\r"):
-                msg_var.set("Caracteres ; et retours-chariot interdits.")
-                return
-            self.cmd_queue.put((CMD_ENROL, name))
-            win.destroy()
-
-        ttk.Button(btns, text="Annuler", style="VPO.TButton",
-                   command=win.destroy).pack(side="right")
-        ttk.Button(btns, text="Confirmer", style="VPOPrimary.TButton",
-                   command=confirm).pack(side="right", padx=(0, 8))
-        win.bind("<Return>", lambda e: confirm())
-        win.bind("<Escape>", lambda e: win.destroy())
-
-    def _on_enrolled(self, name):
+    # ---- Callbacks pour les evenements du worker ---------------------
+    def _on_enrol_batch_done(self, payload):
         self.dataset_label.config(text=self._dataset_text())
-        self._show_toast(f"Identite enregistree : {name}", level="ok")
+        if (self._enrol_wizard is not None
+                and self._enrol_wizard.winfo_exists()):
+            self._enrol_wizard.on_batch_enrolled(payload)
+        else:
+            kept = payload.get("kept", 0)
+            rej = payload.get("rejected", 0)
+            self._show_toast(
+                f"Encodage termine : {kept} vecteurs ({rej} rejetes).",
+                level="ok" if rej == 0 else "info")
+
+    def _on_enrol_batch_fail(self, payload):
+        if (self._enrol_wizard is not None
+                and self._enrol_wizard.winfo_exists()):
+            self._enrol_wizard.on_batch_failed(payload)
+        else:
+            self._show_toast(
+                f"Encodage echoue : {payload.get('error', '?')}",
+                level="error")
+
+    def _on_delete_done(self, payload):
+        name = payload.get("name")
+        self.dataset_label.config(text=self._dataset_text())
+        # Reset banner si la decision en cours referencait l'identite
+        if (self.last_identify is not None
+                and any(cn == name
+                        for cn, _ in self.last_identify.candidates)):
+            self.last_identify = None
+            self._render_top3([], float(self.threshold_var.get()),
+                              accepted=False)
+            self._render_banner(state="wait")
+            self._draw_chart(None)
+            self.overlay_canvas.delete("overlay_anno")
+        if (self._identity_manager is not None
+                and self._identity_manager.winfo_exists()):
+            self._identity_manager.on_delete_done(payload)
+
+    def _on_delete_fail(self, payload):
+        if (self._identity_manager is not None
+                and self._identity_manager.winfo_exists()):
+            self._identity_manager.on_delete_failed(payload)
+        else:
+            self._show_toast(
+                f"Suppression echouee : {payload.get('error', '?')}",
+                level="error")
+
+    def _on_report_done(self, payload):
+        path = payload.get("path", "?")
+        if (self._enrol_wizard is not None
+                and self._enrol_wizard.winfo_exists()):
+            self._enrol_wizard.on_report_done(payload)
+            return
+        if (self._identity_manager is not None
+                and self._identity_manager.winfo_exists()):
+            self._identity_manager.on_report_done(payload)
+            return
+        if self._manual_report_popup is not None:
+            self._manual_report_popup.close()
+            self._manual_report_popup = None
+        self._show_toast(f"Rapport ecrit -- {path}", level="ok")
+
+    def _on_report_fail(self, payload):
+        err = payload.get("error", "?")
+        if (self._enrol_wizard is not None
+                and self._enrol_wizard.winfo_exists()):
+            self._enrol_wizard.on_report_failed(payload)
+            return
+        if (self._identity_manager is not None
+                and self._identity_manager.winfo_exists()):
+            self._identity_manager.on_report_failed(payload)
+            return
+        if self._manual_report_popup is not None:
+            self._manual_report_popup.close()
+            self._manual_report_popup = None
+        self._show_toast(f"Rapport non genere : {err}", level="error")
+
+    # ---- Helpers exposes aux modales ---------------------------------
+    def show_toast(self, text, level="info"):
+        """Alias public pour les modales filles."""
+        self._show_toast(text, level=level)
+
+    def focus_identify(self):
+        """Donne le focus au bouton Identifier (utilise apres la
+        fermeture du wizard pour permettre Enter ou Espace)."""
+        try:
+            self.identify_btn.focus_set()
+        except Exception:
+            pass
+
+    def on_wizard_closed(self, wizard):
+        if self._enrol_wizard is wizard:
+            self._enrol_wizard = None
+
+    def on_manager_closed(self, manager):
+        if self._identity_manager is manager:
+            self._identity_manager = None
 
     def _on_threshold_change(self, _value):
         self._refresh_decision()
