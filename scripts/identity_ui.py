@@ -17,7 +17,6 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -107,14 +106,11 @@ def _bgr_to_imagetk(bgr, target_w, target_h, fit="contain"):
 
 CMD_ENROL_BATCH     = "enrol_batch"
 CMD_DELETE_PERSON   = "delete_person"
-CMD_GENERATE_REPORT = "generate_report"
 
 EV_ENROL_BATCH_DONE = "enrol_batch_done"
 EV_ENROL_BATCH_FAIL = "enrol_batch_fail"
 EV_DELETE_DONE      = "delete_done"
 EV_DELETE_FAIL      = "delete_fail"
-EV_REPORT_DONE      = "report_done"
-EV_REPORT_FAIL      = "report_fail"
 
 
 # ---------------------------------------------------------------------------
@@ -172,12 +168,6 @@ def validate_name(raw: str) -> Optional[str]:
     if _INVALID_NAME_CHARS.search(raw):
         return "Caracteres interdits : ; / \\."
     return None
-
-
-def _safe_event_label(prefix: str, name: str) -> str:
-    """Genere un suffixe de fichier reproductible (ASCII-friendly)."""
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "anonyme"
-    return f"{prefix}_{cleaned}"
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +318,6 @@ class EnrolWizard(tk.Toplevel):
         self._count: int = 0                         # nombre d'images deja prises (0..20)
         self._index_offset: int = 0                  # decalage de numerotation des fichiers
         self._encoding_popup: Optional[LoadingPopup] = None
-        self._report_popup: Optional[LoadingPopup] = None
         self._photo_ref = None
         self._poll_after_id: Optional[str] = None
         self._closed = False
@@ -737,7 +726,6 @@ class EnrolWizard(tk.Toplevel):
             fr is not None and fr.aligned is not None
             and self._count < TOTAL_CAPTURES
             and self._encoding_popup is None
-            and self._report_popup is None
         )
         self._capture_btn.configure(
             state="normal" if can_capture else "disabled")
@@ -808,8 +796,8 @@ class EnrolWizard(tk.Toplevel):
         if not self._phase_b.winfo_ismapped():
             self._close_self()
             return
-        # Si l'encodage / le rapport sont en cours, on ignore
-        if self._encoding_popup is not None or self._report_popup is not None:
+        # Si l'encodage est en cours, on ignore
+        if self._encoding_popup is not None:
             return
         if not self._taken_files:
             self._close_self()
@@ -862,20 +850,23 @@ class EnrolWizard(tk.Toplevel):
                 on_confirm=self._close_self)
             return
 
-        # Lance la generation du rapport
-        self._report_popup = LoadingPopup(
-            self, "Rapport",
-            "Generation du rapport d'evaluation...")
-        thr = float(self.app.threshold_var.get())
-        self.app.cmd_queue.put(
-            (CMD_GENERATE_REPORT,
-             {"event": "add", "name": name,
-              "threshold": thr})
-        )
-        # Memorise pour le toast final
-        self._final_kept = kept
-        self._final_rejected = rejected
-        self._final_name = name
+        # Encodage termine : ferme l'assistant et rend le focus a la
+        # fenetre principale.
+        if rejected == 0:
+            self.app.show_toast(
+                f"Identite {name} enregistree -- {kept} vecteurs encodes",
+                level="ok")
+        else:
+            self.app.show_toast(
+                f"{kept} / {TOTAL_CAPTURES} vecteurs encodes -- "
+                f"{rejected} image(s) rejetee(s)",
+                level="info")
+        self._close_self()
+        # Re-focus sur Identifier pour permettre I/Enter
+        try:
+            self.app.focus_identify()
+        except Exception:
+            pass
 
     def on_batch_failed(self, payload: dict):
         if self._encoding_popup is not None:
@@ -888,43 +879,6 @@ class EnrolWizard(tk.Toplevel):
                       danger_label="Fermer",
                       cancel_label=None,
                       on_confirm=self._close_self)
-
-    def on_report_done(self, payload: dict):
-        if self._report_popup is not None:
-            self._report_popup.close()
-            self._report_popup = None
-        path = payload.get("path", "?")
-        kept = getattr(self, "_final_kept", TOTAL_CAPTURES)
-        rejected = getattr(self, "_final_rejected", 0)
-        name = getattr(self, "_final_name", self._name or "?")
-        if rejected == 0:
-            self.app.show_toast(
-                f"Identite {name} enregistree -- {kept} vecteurs encodes "
-                f"(rapport : {path})",
-                level="ok")
-        else:
-            self.app.show_toast(
-                f"{kept} / {TOTAL_CAPTURES} vecteurs encodes -- "
-                f"{rejected} image(s) rejetee(s) (rapport : {path})",
-                level="info")
-        self._close_self()
-        # Re-focus sur Identifier pour permettre I/Enter
-        try:
-            self.app.focus_identify()
-        except Exception:
-            pass
-
-    def on_report_failed(self, payload: dict):
-        if self._report_popup is not None:
-            self._report_popup.close()
-            self._report_popup = None
-        msg = payload.get("error", "Erreur inconnue durant la generation.")
-        self.app.show_toast(f"Rapport non genere : {msg}", level="error")
-        self._close_self()
-        try:
-            self.app.focus_identify()
-        except Exception:
-            pass
 
     # ---------------- Cleanup ----------------------------------------
     def _close_self(self):
@@ -973,7 +927,6 @@ class IdentityManager(tk.Toplevel):
         install_extra_styles(ttk.Style(self))
 
         self._delete_popup: Optional[LoadingPopup] = None
-        self._report_popup: Optional[LoadingPopup] = None
         self._closed = False
         self._pending_name: Optional[str] = None
         self._pending_files_deleted: bool = False
@@ -1165,17 +1118,11 @@ class IdentityManager(tk.Toplevel):
         if self._delete_popup is not None:
             self._delete_popup.close()
             self._delete_popup = None
-        # Lance le rapport
-        thr = float(self.app.threshold_var.get())
-        self._report_popup = LoadingPopup(
-            self, "Rapport",
-            "Generation du rapport d'evaluation...")
-        self.app.cmd_queue.put(
-            (CMD_GENERATE_REPORT,
-             {"event": "delete",
-              "name": payload.get("name", self._pending_name),
-              "threshold": thr})
-        )
+        name = payload.get("name", self._pending_name) or "?"
+        self.app.show_toast(
+            f"Identite \"{name}\" supprimee.",
+            level="ok")
+        self._on_close()
 
     def on_delete_failed(self, payload: dict):
         if self._delete_popup is not None:
@@ -1184,26 +1131,6 @@ class IdentityManager(tk.Toplevel):
         msg = payload.get("error", "Erreur inconnue durant la suppression.")
         self.app.show_toast(f"Suppression echouee : {msg}", level="error")
         self.refresh()
-
-    def on_report_done(self, payload: dict):
-        if self._report_popup is not None:
-            self._report_popup.close()
-            self._report_popup = None
-        path = payload.get("path", "?")
-        name = self._pending_name or "?"
-        self.app.show_toast(
-            f"Identite \"{name}\" supprimee -- rapport : {path}",
-            level="ok")
-        self._on_close()
-
-    def on_report_failed(self, payload: dict):
-        if self._report_popup is not None:
-            self._report_popup.close()
-            self._report_popup = None
-        self.app.show_toast(
-            f"Rapport non genere : {payload.get('error', '?')}",
-            level="error")
-        self._on_close()
 
     def _on_close(self):
         if self._closed:
@@ -1395,150 +1322,3 @@ class DeleteConfirmDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
 
-# ---------------------------------------------------------------------------
-# Generation du rapport markdown
-# ---------------------------------------------------------------------------
-
-def _format_confusion(M, classes) -> str:
-    """Reprend la mise en forme de scripts/evaluate.print_confusion."""
-    width = max(8, max(len(c) for c in classes) + 1)
-    header = " " * (width + 2) + " ".join(f"{c[:8]:>8}" for c in classes)
-    lines = [header]
-    for i, c in enumerate(classes):
-        row = " ".join(f"{int(M[i, j]):>8d}" for j in range(len(classes)))
-        lines.append(f"{c[:width]:>{width}}  {row}")
-    return "\n".join(lines)
-
-
-def _python_versions() -> tuple[str, str]:
-    return (sys.version.splitlines()[0],
-            getattr(cv2, "__version__", "?"))
-
-
-def generate_evaluation_report(*, names, vectors, threshold: float,
-                                event: str, name: Optional[str],
-                                root_dir: Path) -> Path:
-    """Ecrit reports/<ts>_<event>.md et retourne le chemin relatif (string)."""
-    reports_dir = root_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    if event == "add" and name is not None:
-        suffix = _safe_event_label("add", name)
-    elif event == "delete" and name is not None:
-        suffix = _safe_event_label("delete", name)
-    else:
-        suffix = "manual"
-    out = reports_dir / f"{ts}_{suffix}.md"
-
-    py_ver, cv_ver = _python_versions()
-    n_vecs = len(vectors)
-    counts: dict[str, int] = {}
-    for n in names:
-        counts[n] = counts.get(n, 0) + 1
-    n_persons = len(counts)
-    avg_per_person = (n_vecs / n_persons) if n_persons else 0.0
-
-    lines: list[str] = []
-    push = lines.append
-
-    # 1. En-tete
-    push(f"# Rapport d'evaluation -- VPO ({ts})")
-    push("")
-    if event == "add" and name is not None:
-        push(f"_Declenchement automatique apres ajout de l'identite "
-             f"\"{name}\"._")
-    elif event == "delete" and name is not None:
-        push(f"_Declenchement automatique apres suppression de l'identite "
-             f"\"{name}\"._")
-    else:
-        push("_Declenchement manuel via le bouton \"Exporter rapport\"._")
-    push("")
-    push(f"- Date : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    push(f"- Python : `{py_ver}`")
-    push(f"- OpenCV : `{cv_ver}`")
-    push(f"- IMG_SIZE : `{config.IMG_SIZE}`")
-    push(f"- FEATURE_DIM : `{config.FEATURE_DIM}` "
-         f"(distances={config.NB_DISTANCES}, forme={config.NB_SHAPE})")
-    push(f"- Snake : alpha=`{config.SNAKE_ALPHA}`, "
-         f"beta=`{config.SNAKE_BETA}`, gamma=`{config.SNAKE_GAMMA}`, "
-         f"kappa=`{config.SNAKE_KAPPA}`, "
-         f"iterations=`{config.SNAKE_ITERATIONS}`, "
-         f"points=`{config.SNAKE_NB_POINTS}`")
-    push("")
-
-    # 2. Statistiques du dataset
-    push("## Statistiques du dataset")
-    push("")
-    push(f"- Vecteurs total : **{n_vecs}**")
-    push(f"- Personnes : **{n_persons}**")
-    push(f"- Moyenne vecteurs / personne : **{avg_per_person:.2f}**")
-    push("")
-    push("| Personne | Vecteurs |")
-    push("|---|---:|")
-    for n in sorted(counts.keys(), key=str.casefold):
-        push(f"| {n} | {counts[n]} |")
-    push("")
-
-    # 3. Seuil en cours
-    push("## Seuil de decision en cours")
-    push("")
-    push(f"- Seuil de la session : **{threshold:.3f}**")
-    push(f"- Seuil par defaut (config.py) : `{config.DEFAULT_THRESHOLD}`")
-    push("")
-    push("> Note : ce seuil est specifique a la session courante du banc "
-         "de test et n'est pas reecrit dans `src/config.py`.")
-    push("")
-
-    # 4. Leave-one-out + matrice de confusion
-    push("## Evaluation leave-one-out (au seuil courant)")
-    push("")
-    if n_persons < 2 or avg_per_person < 2.0:
-        push("> Donnees insuffisantes : `evaluation.leave_one_out` "
-             "necessite au moins 2 vecteurs en moyenne par personne.")
-        push("")
-        push("## Metriques par classe")
-        push("")
-        push("> Section ignoree (donnees insuffisantes).")
-        push("")
-        push("## Accuracy globale et taux de rejet")
-        push("")
-        push("> Section ignoree (donnees insuffisantes).")
-        out.write_text("\n".join(lines), encoding="utf-8")
-        return out
-
-    classes, y_true, y_pred = evaluation.leave_one_out(
-        names, vectors, threshold)
-    classes_aug = classes + ["Inconnu"]
-    M = evaluation.confusion_matrix(y_true, y_pred, classes_aug)
-    push("Matrice de confusion (lignes = verite, colonnes = predit) :")
-    push("")
-    push("```")
-    push(_format_confusion(M, classes_aug))
-    push("```")
-    push("")
-
-    # 5. Metriques par classe
-    push("## Metriques par classe")
-    push("")
-    push("| Classe | Precision | Rappel | Specificite | Support |")
-    push("|---|---:|---:|---:|---:|")
-    for c, m in zip(classes_aug, evaluation.metrics_per_class(M)):
-        push(f"| {c} | {m['precision']:.3f} | {m['rappel']:.3f} | "
-             f"{m['specificite']:.3f} | {m['support']} |")
-    push("")
-
-    # 6. Accuracy globale + rejet
-    correct = sum(1 for a, b in zip(y_true, y_pred) if a == b)
-    rejected = sum(1 for b in y_pred if b == "Inconnu")
-    n = len(y_true)
-    acc = correct / n if n else 0.0
-    rej = rejected / n if n else 0.0
-    push("## Accuracy globale et taux de rejet")
-    push("")
-    push(f"- Accuracy : **{acc * 100:.3f} %** ({correct}/{n})")
-    push(f"- Taux de rejet : **{rej * 100:.3f} %** ({rejected}/{n})")
-    push("")
-
-    out.write_text("\n".join(lines), encoding="utf-8")
-    return out

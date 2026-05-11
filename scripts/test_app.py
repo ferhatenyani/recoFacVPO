@@ -25,7 +25,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -38,9 +37,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
-from PIL import Image, ImageTk, ImageGrab
+from PIL import Image, ImageTk
 
-from src import config, dataset, detection, features, identify, landmarks
+from src import config, dataset, detection, evaluation, features, identify, landmarks
 from src import snake as snk
 
 # Theme + helpers UI partages avec les modales (wizard, gestionnaire,
@@ -55,16 +54,12 @@ from identity_ui import (
     IdentityManager,
     LoadingPopup,
     install_extra_styles,
-    generate_evaluation_report,
     CMD_ENROL_BATCH,
     CMD_DELETE_PERSON,
-    CMD_GENERATE_REPORT,
     EV_ENROL_BATCH_DONE,
     EV_ENROL_BATCH_FAIL,
     EV_DELETE_DONE,
     EV_DELETE_FAIL,
-    EV_REPORT_DONE,
-    EV_REPORT_FAIL,
 )
 
 
@@ -90,11 +85,11 @@ class IdentifyResult:
     candidates: list                    # [(name, dist), ...]
     threshold_at_run: float
     elapsed_ms: float
+    auto_threshold: bool                # True si seuil issu d'un sweep
 
 
 # Commandes UI -> worker
-# CMD_ENROL_BATCH / CMD_DELETE_PERSON / CMD_GENERATE_REPORT sont importes
-# depuis identity_ui (cf. plus bas, apres les helpers UI partages).
+# CMD_ENROL_BATCH / CMD_DELETE_PERSON sont importes depuis identity_ui.
 CMD_IDENTIFY = "identify"
 
 
@@ -180,6 +175,10 @@ class TestApp:
         # Etat partage
         self.names, self.vectors = dataset.load()
         self.threshold_var = tk.DoubleVar(value=config.DEFAULT_THRESHOLD)
+        # Coche "Auto" : si vraie, chaque identification recalcule le
+        # seuil optimal par balayage (LOO) avant de decider. Sinon le
+        # systeme respecte la valeur courante du curseur.
+        self.auto_threshold_var = tk.BooleanVar(value=False)
         self.last_identify: Optional[IdentifyResult] = None
         self.last_frame: Optional[FrameResult] = None
         self.fps_smoothed = 0.0
@@ -195,11 +194,9 @@ class TestApp:
         # References d'images Tk (sinon GC)
         self._img_refs = {}
 
-        # Modales actives (wizard d'enregistrement, gestionnaire,
-        # popup d'export manuel du rapport)
+        # Modales actives (wizard d'enregistrement, gestionnaire)
         self._enrol_wizard: Optional[EnrolWizard] = None
         self._identity_manager: Optional[IdentityManager] = None
-        self._manual_report_popup: Optional[LoadingPopup] = None
 
         # Construction UI
         self._build_ui()
@@ -264,6 +261,15 @@ class TestApp:
                     bordercolor=Theme.BORDER_SOFT,
                     lightcolor=Theme.INFO,
                     darkcolor=Theme.INFO_SOFT)
+
+        s.configure("VPO.TCheckbutton",
+                    background=Theme.SURFACE_1,
+                    foreground=Theme.TEXT_HI,
+                    focuscolor=Theme.INFO,
+                    font=Theme.label(9))
+        s.map("VPO.TCheckbutton",
+              background=[("active", Theme.SURFACE_1)],
+              foreground=[("disabled", Theme.TEXT_LOW)])
 
         # Styles additionnels (LoadingPopup, scrollbar du gestionnaire,
         # boutons fantomes des dialogues).
@@ -568,13 +574,7 @@ class TestApp:
                    command=self._on_open_enrol_wizard).pack(side="left",
                                                             padx=(0, 8))
         ttk.Button(left, text="Gerer les identites", style="VPO.TButton",
-                   command=self._on_open_manager).pack(side="left",
-                                                       padx=(0, 8))
-        ttk.Button(left, text="Exporter rapport", style="VPO.TButton",
-                   command=self._on_export_report).pack(side="left",
-                                                        padx=(0, 8))
-        ttk.Button(left, text="Snapshot", style="VPO.TButton",
-                   command=self._on_snapshot).pack(side="left")
+                   command=self._on_open_manager).pack(side="left")
 
         # Quitter (droite)
         ttk.Button(inner, text="Quitter  (Q)", style="VPODanger.TButton",
@@ -594,6 +594,12 @@ class TestApp:
                                     bg=Theme.SURFACE_1, fg=Theme.TEXT_HI,
                                     font=Theme.mono(10))
         self.thr_readout.pack(side="right")
+        self.auto_thr_chk = ttk.Checkbutton(
+            head, text="Auto (sweep LOO)",
+            variable=self.auto_threshold_var,
+            style="VPO.TCheckbutton",
+            command=self._on_auto_toggle)
+        self.auto_thr_chk.pack(side="right", padx=(0, 12))
 
         scale = ttk.Scale(thr, from_=0.05, to=0.50,
                           orient="horizontal",
@@ -681,33 +687,58 @@ class TestApp:
                     except queue.Empty:
                         break
                     if action == CMD_IDENTIFY:
-                        self._do_identify(aligned)
+                        self._do_identify(aligned, payload)
                     elif action == CMD_ENROL_BATCH:
                         self._do_enrol_batch(payload)
                     elif action == CMD_DELETE_PERSON:
                         self._do_delete_person(payload)
-                    elif action == CMD_GENERATE_REPORT:
-                        self._do_generate_report(payload)
         finally:
             cap.release()
 
-    def _do_identify(self, aligned):
+    def _do_identify(self, aligned, payload):
         if aligned is None:
             self.event_queue.put(("toast", "Aucun visage detecte."))
             return
-        thr = float(self.threshold_var.get())
+        payload = payload or {}
+        auto_mode = bool(payload.get("auto", False))
+        manual_thr = float(payload.get("manual_threshold",
+                                       config.DEFAULT_THRESHOLD))
+        # Snapshot du dataset (sous verrou) -- evite toute race avec
+        # un add/delete concurrent.
+        with self.dataset_lock:
+            names_snapshot = list(self.names)
+            vectors_snapshot = (self.vectors.copy()
+                                if len(self.vectors) else self.vectors)
+        # Mode Auto : balayage de seuil (LOO) pour caler le seuil
+        # optimal sur l'etat courant. Si la base est trop petite (LOO
+        # degenere) ou si Auto est desactive, on respecte le seuil du
+        # curseur.
+        used_thr = manual_thr
+        used_auto = False
+        if auto_mode and (len(vectors_snapshot) >= 4
+                          and len(set(names_snapshot)) >= 2):
+            try:
+                sweep = evaluation.threshold_sweep(
+                    names_snapshot, vectors_snapshot,
+                    np.linspace(0.05, 0.50, 19))
+                best = max(sweep, key=lambda r: r["accuracy"])
+                used_thr = float(best["threshold"])
+                used_auto = True
+            except Exception:
+                pass
+        # Pipeline d'extraction
         t0 = time.time()
         contour = snk.fit_snake(aligned)
         lm = landmarks.detect_landmarks(aligned, snake=contour)
         vec = features.build_feature_vector(lm, snake=contour)
-        with self.dataset_lock:
-            cands = identify.search(vec, self.names, self.vectors)
+        cands = identify.search(vec, names_snapshot, vectors_snapshot)
         elapsed_ms = (time.time() - t0) * 1000.0
         res = IdentifyResult(aligned=aligned, snake_points=contour,
                              landmarks=lm, vector=vec,
                              candidates=cands,
-                             threshold_at_run=thr,
-                             elapsed_ms=elapsed_ms)
+                             threshold_at_run=used_thr,
+                             elapsed_ms=elapsed_ms,
+                             auto_threshold=used_auto)
         self.event_queue.put(("identify", res))
 
     def _do_enrol_batch(self, payload):
@@ -793,38 +824,6 @@ class TestApp:
 
         self.event_queue.put((EV_DELETE_DONE, {"name": name}))
 
-    def _do_generate_report(self, payload):
-        """Genere le rapport markdown pour l'etat courant du dataset."""
-        event = payload["event"]
-        name = payload.get("name")
-        threshold = float(payload["threshold"])
-        try:
-            with self.dataset_lock:
-                names_snapshot = list(self.names)
-                vectors_snapshot = (self.vectors.copy()
-                                    if len(self.vectors) else
-                                    self.vectors)
-            path = generate_evaluation_report(
-                names=names_snapshot,
-                vectors=vectors_snapshot,
-                threshold=threshold,
-                event=event,
-                name=name,
-                root_dir=ROOT,
-            )
-        except Exception as exc:
-            self.event_queue.put(
-                (EV_REPORT_FAIL,
-                 {"error": f"{type(exc).__name__}: {exc}"}))
-            return
-        try:
-            rel = path.relative_to(ROOT)
-        except ValueError:
-            rel = path
-        self.event_queue.put(
-            (EV_REPORT_DONE,
-             {"path": str(rel).replace("\\", "/")}))
-
     # ---- Polling Tk --------------------------------------------------
     def _poll(self):
         # Frames live (consomme la plus recente)
@@ -855,10 +854,6 @@ class TestApp:
                     self._on_delete_done(payload)
                 elif kind == EV_DELETE_FAIL:
                     self._on_delete_fail(payload)
-                elif kind == EV_REPORT_DONE:
-                    self._on_report_done(payload)
-                elif kind == EV_REPORT_FAIL:
-                    self._on_report_fail(payload)
         except queue.Empty:
             pass
 
@@ -920,6 +915,13 @@ class TestApp:
     # ---- Resultat d'identification -----------------------------------
     def _on_identify_result(self, res: IdentifyResult):
         self.last_identify = res
+        # Si Auto etait coche, le worker a calcule un seuil optimal par
+        # balayage LOO -- on le pousse dans le curseur pour que la
+        # decision affichee soit faite a ce seuil. En mode manuel, le
+        # curseur reste maitre : on n'y touche pas.
+        if res.auto_threshold:
+            self.threshold_var.set(res.threshold_at_run)
+            self.thr_readout.config(text=f"{res.threshold_at_run:.3f}")
         # Snake + landmarks overlay (sur image figee)
         photo, _ = _bgr_to_imagetk(res.aligned,
                                    self.FACE_CV_SIZE, self.FACE_CV_SIZE,
@@ -1194,7 +1196,22 @@ class TestApp:
 
     # ---- Actions UI --------------------------------------------------
     def _on_identify(self):
-        self.cmd_queue.put((CMD_IDENTIFY, None))
+        # Lit la coche Auto sur le thread Tk (jamais cote worker) et
+        # transmet la decision au worker via la commande.
+        auto = bool(self.auto_threshold_var.get())
+        manual_thr = float(self.threshold_var.get())
+        self.cmd_queue.put(
+            (CMD_IDENTIFY, {"auto": auto, "manual_threshold": manual_thr}))
+
+    def _on_auto_toggle(self):
+        if self.auto_threshold_var.get():
+            self._show_toast(
+                "Auto active : le seuil sera recalcule a chaque identification.",
+                level="info")
+        else:
+            self._show_toast(
+                "Auto desactive : seuil pilote par le curseur.",
+                level="info")
 
     def _on_open_enrol_wizard(self):
         """Ouvre le wizard d'enregistrement multi-poses."""
@@ -1211,18 +1228,6 @@ class TestApp:
             self._identity_manager.lift()
             return
         self._identity_manager = IdentityManager(self)
-
-    def _on_export_report(self):
-        """Genere un rapport manuel sur l'etat courant du dataset."""
-        if self._manual_report_popup is not None:
-            return
-        self._manual_report_popup = LoadingPopup(
-            self.root, "Rapport",
-            "Generation du rapport d'evaluation...")
-        self.cmd_queue.put(
-            (CMD_GENERATE_REPORT,
-             {"event": "manual", "name": None,
-              "threshold": float(self.threshold_var.get())}))
 
     # ---- Callbacks pour les evenements du worker ---------------------
     def _on_enrol_batch_done(self, payload):
@@ -1272,36 +1277,6 @@ class TestApp:
                 f"Suppression echouee : {payload.get('error', '?')}",
                 level="error")
 
-    def _on_report_done(self, payload):
-        path = payload.get("path", "?")
-        if (self._enrol_wizard is not None
-                and self._enrol_wizard.winfo_exists()):
-            self._enrol_wizard.on_report_done(payload)
-            return
-        if (self._identity_manager is not None
-                and self._identity_manager.winfo_exists()):
-            self._identity_manager.on_report_done(payload)
-            return
-        if self._manual_report_popup is not None:
-            self._manual_report_popup.close()
-            self._manual_report_popup = None
-        self._show_toast(f"Rapport ecrit -- {path}", level="ok")
-
-    def _on_report_fail(self, payload):
-        err = payload.get("error", "?")
-        if (self._enrol_wizard is not None
-                and self._enrol_wizard.winfo_exists()):
-            self._enrol_wizard.on_report_failed(payload)
-            return
-        if (self._identity_manager is not None
-                and self._identity_manager.winfo_exists()):
-            self._identity_manager.on_report_failed(payload)
-            return
-        if self._manual_report_popup is not None:
-            self._manual_report_popup.close()
-            self._manual_report_popup = None
-        self._show_toast(f"Rapport non genere : {err}", level="error")
-
     # ---- Helpers exposes aux modales ---------------------------------
     def show_toast(self, text, level="info"):
         """Alias public pour les modales filles."""
@@ -1325,41 +1300,6 @@ class TestApp:
 
     def _on_threshold_change(self, _value):
         self._refresh_decision()
-
-    def _on_snapshot(self):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = ROOT / "screenshots" / ts
-        out_dir.mkdir(parents=True, exist_ok=True)
-        saved = []
-        # 1) frame webcam
-        if self.last_frame is not None and self.last_frame.bgr is not None:
-            p = out_dir / "webcam.png"
-            cv2.imwrite(str(p), self.last_frame.bgr)
-            saved.append(p.name)
-        # 2) visage aligne
-        if self.last_frame is not None and self.last_frame.aligned is not None:
-            p = out_dir / "aligned.png"
-            cv2.imwrite(str(p), self.last_frame.aligned)
-            saved.append(p.name)
-        # 3) capture de la fenetre (bento global)
-        try:
-            self.root.update_idletasks()
-            x = self.root.winfo_rootx()
-            y = self.root.winfo_rooty()
-            w = self.root.winfo_width()
-            h = self.root.winfo_height()
-            shot = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-            p = out_dir / "bento.png"
-            shot.save(p)
-            saved.append(p.name)
-        except Exception as exc:
-            self._show_toast(f"Snapshot fenetre echec: {exc}", level="error")
-        if saved:
-            self._show_toast(
-                f"Snapshot -> screenshots/{ts}/  ({', '.join(saved)})",
-                level="ok")
-        else:
-            self._show_toast("Rien a sauvegarder.", level="error")
 
     def _on_quit(self):
         self.stop_event.set()
